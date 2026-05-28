@@ -1,282 +1,283 @@
 #include "Arduino.h"
 #include "esp_wifi.h"
-#include "esp_now.h"
-#include "nvs_flash.h"
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
-#include "secrets.h"
-#include "config.h"
-#include "ca_cert.h"
 #include "mbedtls/sha256.h"
-#include <math.h>
+#include <ArduinoJson.h>
+#include "secrets.h"   // SSID, WIFIPASSWORD
+#include "config.h"    // DEVICENAME
+#include "ca_cert.h"   // ikke længere brugt, men beholdt for kompatibilitet
 
-// ===================== ESP-NOW PAKKE =====================
-typedef struct {
-  char   nodeName[16];
-  char   deviceName[16];
-  int8_t rssi;
-  float  distance;
-} EspNowPayload;
+// ===================== CONFIG =====================
+// UDP destination — sæt til laptoppens IP og port
+#define UDP_HOST     "192.168.0.144"   // <-- SKIFT TIL LAPTOPPENS IP
+#define UDP_PORT     5005
 
-// ===================== DETECTION QUEUE =====================
-#define QUEUE_SIZE 32
+// Master-position i rummet (meter)
+#define MASTER_X   0.0f
+#define MASTER_Y   4.0f
 
-typedef struct {
-  char    anonId[65];
-  int8_t  rssi;
-  float   distance;
-  bool    isKnown;
-  int     knownIndex;
-  bool    fromESPNow;
-  char    espNowNode[16];
-  char    espNowDevice[16];
-} DetectionEvent;
+#define WINDOW_MS   2000
+#define MIN_RSSI    -85
+#define MAX_DEVICES  40
+#define THROTTLE_MS  500
+#define ROUTER_CHANNEL 6
 
-static DetectionEvent eventQueue[QUEUE_SIZE];
-static volatile int   queueHead = 0;
-static volatile int   queueTail = 0;
+// ===================== UDP =====================
+static WiFiUDP udp;
 
-static inline bool queueFull()  { return ((queueTail + 1) % QUEUE_SIZE) == queueHead; }
-static inline bool queueEmpty() { return queueHead == queueTail; }
+void sendUDP(const char* payload) {
+  udp.beginPacket(UDP_HOST, UDP_PORT);
+  udp.write((const uint8_t*)payload, strlen(payload));
+  udp.endPacket();
+}
 
-static inline void enqueueLocal(const char* anonId, int8_t rssi, float distance, bool isKnown, int knownIndex) {
-  if (!queueFull()) {
-    strncpy(eventQueue[queueTail].anonId, anonId, 65);
-    eventQueue[queueTail].rssi        = rssi;
-    eventQueue[queueTail].distance    = distance;
-    eventQueue[queueTail].isKnown     = isKnown;
-    eventQueue[queueTail].knownIndex  = knownIndex;
-    eventQueue[queueTail].fromESPNow  = false;
-    queueTail = (queueTail + 1) % QUEUE_SIZE;
+// ===================== DAGLIGT SALT =====================
+static char dailySalt[16] = "SALT_INIT";
+
+void updateDailySalt() {
+  struct tm t;
+  if (getLocalTime(&t)) {
+    snprintf(dailySalt, sizeof(dailySalt), "%04d%02d%02d",
+      t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
   }
 }
 
-static inline void enqueueESPNow(const EspNowPayload* pkt) {
-  if (!queueFull()) {
-    eventQueue[queueTail].fromESPNow = true;
-    strncpy(eventQueue[queueTail].espNowNode,   pkt->nodeName,   16);
-    strncpy(eventQueue[queueTail].espNowDevice, pkt->deviceName, 16);
-    eventQueue[queueTail].rssi     = pkt->rssi;
-    eventQueue[queueTail].distance = pkt->distance;
-    queueTail = (queueTail + 1) % QUEUE_SIZE;
-  }
+
+
+// ===================== ANONYMISERING =====================
+void makeDevId(const char* macHash, char* outDevId) {
+  char input[32];
+  snprintf(input, sizeof(input), "%s%s", macHash, dailySalt);
+  uint8_t digest[32];
+  mbedtls_sha256_ret((const uint8_t*)input, strlen(input), digest, 0);
+  snprintf(outDevId, 10, "DEV-%02X%02X", digest[0], digest[1]);
 }
 
-static bool dequeueEvent(DetectionEvent* out) {
-  if (queueEmpty()) return false;
-  *out = eventQueue[queueHead];
-  queueHead = (queueHead + 1) % QUEUE_SIZE;
-  return true;
-}
-
-// ===================== TRILATERATION =====================
-// Gemmer seneste måling fra hver node: { nodeName, x, y, distance, timestamp }
-typedef struct {
-  char  nodeName[16];
-  float x;
-  float y;
-  float distance;
-  unsigned long timestamp;
-} NodeMeasurement;
-
-#define MAX_NODES 3
-#define MEASUREMENT_TIMEOUT_MS (60UL * 1000UL) // 60 sekunder
-
-static NodeMeasurement measurements[MAX_NODES];
-static int measurementCount = 0;
-
-// Find eller opret slot til en node
-static int findOrCreateSlot(const char* nodeName) {
-  for (int i = 0; i < measurementCount; i++) {
-    if (strcmp(measurements[i].nodeName, nodeName) == 0) return i;
-  }
-  if (measurementCount < MAX_NODES) {
-    return measurementCount++;
-  }
-  return -1;
-}
-
-// Ryd målinger ældre end timeout
-static void cleanOldMeasurements() {
-  unsigned long now = millis();
-  for (int i = 0; i < measurementCount; i++) {
-    if (now - measurements[i].timestamp > MEASUREMENT_TIMEOUT_MS) {
-      Serial.printf("[DATA] Sletter forældet måling fra %s\n", measurements[i].nodeName);
-      // Flyt sidste element til denne plads
-      measurements[i] = measurements[measurementCount - 1];
-      measurementCount--;
-      i--;
-    }
-  }
-}
-
-// Trilateration — mindste kvadraters metode med 3 punkter
-static bool calculatePosition(float* outX, float* outY) {
-  if (measurementCount < 3) return false;
-
-  float x1 = measurements[0].x, y1 = measurements[0].y, r1 = measurements[0].distance;
-  float x2 = measurements[1].x, y2 = measurements[1].y, r2 = measurements[1].distance;
-  float x3 = measurements[2].x, y3 = measurements[2].y, r3 = measurements[2].distance;
-
-  // Løs lineært ligningssystem afledt fra tre cirkelligninger
-  float A = 2 * (x2 - x1);
-  float B = 2 * (y2 - y1);
-  float C = r1*r1 - r2*r2 - x1*x1 + x2*x2 - y1*y1 + y2*y2;
-  float D = 2 * (x3 - x2);
-  float E = 2 * (y3 - y2);
-  float F = r2*r2 - r3*r3 - x2*x2 + x3*x3 - y2*y2 + y3*y3;
-
-  float denom = A * E - B * D;
-  if (fabs(denom) < 0.0001) return false; // Singulær — ESP32'er på linje
-
-  *outX = (C * E - F * B) / denom;
-  *outY = (A * F - D * C) / denom;
-  return true;
-}
-
-// ===================== DEVICE IDENTITY =====================
-String myName = "UNKNOWN";
-float  myX    = 0.0;
-float  myY    = 0.0;
-
-// ===================== TIMESTAMP =====================
-String getTimestamp() {
-  struct tm timeinfo;
-  char timestamp[30] = "unknown";
-  if (getLocalTime(&timeinfo)) {
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &timeinfo);
-  }
-  return String(timestamp);
-}
-
-// ===================== HASH MAC =====================
-void hashMAC(uint8_t* mac, char* output) {
+// ===================== MAC HASH =====================
+void macToHash(const uint8_t* mac, char* outHex8) {
   uint8_t input[6 + 20];
   memcpy(input, mac, 6);
   memcpy(input + 6, SALT, strlen(SALT));
-  byte hash[32];
-  mbedtls_sha256_ret(input, 6 + strlen(SALT), hash, 0);
-  for (int i = 0; i < 32; i++) {
-    sprintf(output + i * 2, "%02x", hash[i]);
+  uint8_t digest[32];
+  mbedtls_sha256_ret(input, 6 + strlen(SALT), digest, 0);
+  snprintf(outHex8, 9, "%02X%02X%02X%02X",
+    digest[0], digest[1], digest[2], digest[3]);
+}
+
+// ===================== DEVICE TABLE =====================
+typedef struct {
+  char          macHash[9];
+  char          devId[10];
+  float         axPos, ayPos;
+  int8_t        aRssi;
+  unsigned long aTime;
+  float         bxPos, byPos;
+  int8_t        bRssi;
+  unsigned long bTime;
+  float         mxPos, myPos;
+  int8_t        mRssi;
+  unsigned long mTime;
+  float         estX, estY;
+  bool          published;
+} DeviceEntry;
+
+static DeviceEntry devices[MAX_DEVICES];
+static int         deviceCount = 0;
+
+DeviceEntry* findOrCreate(const char* macHash) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (strcmp(devices[i].macHash, macHash) == 0) return &devices[i];
   }
-  output[64] = '\0';
-}
-
-// ===================== MQTT =====================
-static WiFiClientSecure tlsClient;
-static PubSubClient     mqttClient(tlsClient);
-
-// ===================== AFSTAND FRA RSSI =====================
-float calculateDistance(int rssi, int txPower = -59, float n = 2.5) {
-  return pow(10.0, (txPower - rssi) / (10.0 * n));
-}
-
-// ===================== DEVICE ID =====================
-void espId() {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  Serial.printf("[BOOT] Min MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  for (int i = 0; i < 3; i++) {
-    if (memcmp(mac, espMACs[i], 6) == 0) {
-      myName = espNames[i];
-      myX    = espPositions[i][0];
-      myY    = espPositions[i][1];
-      Serial.printf("[BOOT] %s på position (%.1f, %.1f)\n", myName.c_str(), myX, myY);
-      return;
+  if (deviceCount >= MAX_DEVICES) {
+    int oldest = 0;
+    unsigned long minTime = ULONG_MAX;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+      unsigned long t = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
+      if (t < minTime) { minTime = t; oldest = i; }
     }
+    memset(&devices[oldest], 0, sizeof(DeviceEntry));
+    strncpy(devices[oldest].macHash, macHash, 9);
+    makeDevId(macHash, devices[oldest].devId);
+    return &devices[oldest];
   }
-  Serial.println("[BOOT] ADVARSEL — MAC ikke genkendt i secrets.h!");
+  DeviceEntry* e = &devices[deviceCount++];
+  memset(e, 0, sizeof(DeviceEntry));
+  strncpy(e->macHash, macHash, 9);
+  makeDevId(macHash, e->devId);
+  return e;
 }
 
-// ===================== GEM MÅLING OG BEREGN =====================
-void storeMeasurementAndCalculate(const char* nodeName, float nodeX, float nodeY,
-                                   float distance, const char* deviceName) {
-  int slot = findOrCreateSlot(nodeName);
-  if (slot < 0) return;
-
-  strncpy(measurements[slot].nodeName, nodeName, 16);
-  measurements[slot].x         = nodeX;
-  measurements[slot].y         = nodeY;
-  measurements[slot].distance  = distance;
-  measurements[slot].timestamp = millis();
-
-  cleanOldMeasurements();
-
-  if (measurementCount < 3) {
-    Serial.printf("[TRILAT] Venter — har %d/3 målinger\n", measurementCount);
-    return;
-  }
-
-  float posX, posY;
-  if (calculatePosition(&posX, &posY)) {
-    Serial.printf("[TRILAT] Position beregnet: (%.2f, %.2f)\n", posX, posY);
-
-    if (mqttClient.connected()) {
-      char payload[192];
-      snprintf(payload, sizeof(payload),
-        "{\"device\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"timestamp\":\"%s\"}",
-        deviceName,
-        posX,
-        posY,
-        getTimestamp().c_str()
-      );
-      mqttClient.publish("/devices/device03/position", payload);
-      Serial.println("[MQTT] Position sendt: " + String(payload));
-    }
-
-    // Ryd efter beregning
-    measurementCount = 0;
-    Serial.println("[DATA] Målinger ryddet efter beregning");
-  } else {
-    Serial.println("[TRILAT] Beregning fejlede — ESP32'er muligvis på linje");
-  }
+// ===================== TRILATERERING =====================
+float rssiToDistance(int8_t rssi, int txPower = -59, float n = 2.5) {
+  return pow(10.0f, (txPower - rssi) / (10.0f * n));
 }
 
-// ===================== ESP-NOW MODTAG =====================
-void onESPNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
-  if (len != sizeof(EspNowPayload)) return;
-  EspNowPayload pkt;
-  memcpy(&pkt, data, sizeof(pkt));
-  enqueueESPNow(&pkt);
+static bool weightedCentroid(float x1, float y1, int8_t r1,
+                              float x2, float y2, int8_t r2,
+                              float* outX, float* outY) {
+  float d1 = rssiToDistance(r1), w1 = 1.0f / (d1*d1 + 0.001f);
+  float d2 = rssiToDistance(r2), w2 = 1.0f / (d2*d2 + 0.001f);
+  float total = w1 + w2;
+  *outX = (w1*x1 + w2*x2) / total;
+  *outY = (w1*y1 + w2*y2) / total;
+  return true;
 }
 
-// ===================== SNIFFER CALLBACK =====================
+bool triangulate(DeviceEntry* dev, float* outX, float* outY) {
+  unsigned long now = millis();
+  bool hasA = (dev->aTime > 0) && ((now - dev->aTime) < WINDOW_MS) && (dev->aRssi > MIN_RSSI);
+  bool hasB = (dev->bTime > 0) && ((now - dev->bTime) < WINDOW_MS) && (dev->bRssi > MIN_RSSI);
+  bool hasM = (dev->mTime > 0) && ((now - dev->mTime) < WINDOW_MS) && (dev->mRssi > MIN_RSSI);
+
+  int count = (int)hasA + (int)hasB + (int)hasM;
+  if (count == 0) return false;
+
+  if (count == 1) {
+    if (hasA)      { *outX = dev->axPos; *outY = dev->ayPos; }
+    else if (hasB) { *outX = dev->bxPos; *outY = dev->byPos; }
+    else           { *outX = MASTER_X;   *outY = MASTER_Y; }
+    return true;
+  }
+
+  if (count == 2) {
+    float x1, y1, x2, y2; int8_t r1, r2;
+    if      (!hasA) { x1=dev->bxPos; y1=dev->byPos; r1=dev->bRssi; x2=MASTER_X;   y2=MASTER_Y;   r2=dev->mRssi; }
+    else if (!hasB) { x1=dev->axPos; y1=dev->ayPos; r1=dev->aRssi; x2=MASTER_X;   y2=MASTER_Y;   r2=dev->mRssi; }
+    else            { x1=dev->axPos; y1=dev->ayPos; r1=dev->aRssi; x2=dev->bxPos; y2=dev->byPos; r2=dev->bRssi; }
+    return weightedCentroid(x1, y1, r1, x2, y2, r2, outX, outY);
+  }
+
+  // Alle 3 — ægte trilaterering med Cramers regel
+  float x1 = dev->axPos, y1 = dev->ayPos, d1 = rssiToDistance(dev->aRssi);
+  float x2 = dev->bxPos, y2 = dev->byPos, d2 = rssiToDistance(dev->bRssi);
+  float x3 = MASTER_X,   y3 = MASTER_Y,   d3 = rssiToDistance(dev->mRssi);
+
+  float A11 = 2*(x2-x1), A12 = 2*(y2-y1);
+  float A21 = 2*(x3-x1), A22 = 2*(y3-y1);
+  float b1  = d1*d1 - d2*d2 - x1*x1 + x2*x2 - y1*y1 + y2*y2;
+  float b2  = d1*d1 - d3*d3 - x1*x1 + x3*x3 - y1*y1 + y3*y3;
+  float det = A11*A22 - A12*A21;
+
+  if (fabsf(det) < 0.001f) {
+    float totalW = 0, sumX = 0, sumY = 0;
+    auto add = [&](float x, float y, int8_t rssi) {
+      float d = rssiToDistance(rssi);
+      float w = 1.0f / (d*d + 0.001f);
+      sumX += w*x; sumY += w*y; totalW += w;
+    };
+    add(x1, y1, dev->aRssi);
+    add(x2, y2, dev->bRssi);
+    add(x3, y3, dev->mRssi);
+    *outX = sumX / totalW;
+    *outY = sumY / totalW;
+    return true;
+  }
+
+  *outX = (b1*A22 - b2*A12) / det;
+  *outY = (A11*b2 - A21*b1) / det;
+  return true;
+}
+
+// ===================== SNIFFER =====================
+#define QUEUE_SIZE 32
+
+typedef struct { uint8_t mac[6]; int8_t rssi; } SniffEvent;
+static SniffEvent    sniffQueue[QUEUE_SIZE];
+static volatile int  qHead = 0;
+static volatile int  qTail = 0;
+static inline bool   qFull()  { return ((qTail + 1) % QUEUE_SIZE) == qHead; }
+static inline bool   qEmpty() { return qHead == qTail; }
+
+typedef struct {
+  uint8_t frame_ctrl[2], duration[2], addr1[6], addr2[6], addr3[6], seq_ctrl[2];
+} wifi_ieee80211_mac_hdr_t;
+typedef struct { wifi_ieee80211_mac_hdr_t hdr; uint8_t payload[0]; } wifi_ieee80211_packet_t;
+
 void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
-
-  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-
-  typedef struct {
-    uint8_t frame_ctrl[2];
-    uint8_t duration[2];
-    uint8_t addr1[6];
-    uint8_t addr2[6];
-    uint8_t addr3[6];
-    uint8_t seq_ctrl[2];
-  } hdr_t;
-
-  hdr_t* hdr = (hdr_t*)pkt->payload;
-  uint8_t* mac = hdr->addr2;
+  wifi_promiscuous_pkt_t*  pkt  = (wifi_promiscuous_pkt_t*)buf;
+  wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)pkt->payload;
+  uint8_t* mac = ipkt->hdr.addr2;
   if (mac[0] & 0x01) return;
+  if (mac[0] & 0x02) return;
+  if (!qFull()) {
+    memcpy(sniffQueue[qTail].mac, mac, 6);
+    sniffQueue[qTail].rssi = pkt->rx_ctrl.rssi;
+    qTail = (qTail + 1) % QUEUE_SIZE;
+  }
+}
 
-  int8_t rssi    = pkt->rx_ctrl.rssi;
-  float distance = calculateDistance(rssi);
+// ===================== SLAVE DATA VIA UDP INDGÅENDE =====================
+// Slaverne sender stadig til MQTT-brokeren — masteren abonnerer IKKE længere.
+// Slaves' data modtages via dedikeret UDP-port fra slaverne direkte.
+// Slave skal sende til MASTER_UDP_PORT i stedet for MQTT.
+#define SLAVE_UDP_PORT 5006
+static WiFiUDP slaveUdp;
 
-  bool isKnown   = false;
-  int knownIndex = -1;
-  for (int i = 0; i < knownMACCount; i++) {
-    if (memcmp(mac, knownMACs[i], 6) == 0) {
-      isKnown    = true;
-      knownIndex = i;
-      break;
-    }
+void processSlavePacket(const char* buf, size_t len) {
+  char tmp[256];
+  if (len >= sizeof(tmp)) return;
+  memcpy(tmp, buf, len);
+  tmp[len] = '\0';
+
+  JsonDocument doc;
+  if (deserializeJson(doc, tmp)) return;
+
+  const char* macHash = doc["macHash"];
+  int8_t      rssi    = doc["rssi"];
+  float       sx      = doc["x"];
+  float       sy      = doc["y"];
+  const char* slave   = doc["slave"];
+
+  if (!macHash || !slave || rssi >= 0 || rssi < MIN_RSSI) return;
+
+  DeviceEntry* dev = findOrCreate(macHash);
+  unsigned long now = millis();
+
+  // Identificer slave på navn
+  if (strstr(slave, "ESP32_A")) {
+    dev->aRssi = rssi; dev->axPos = sx; dev->ayPos = sy; dev->aTime = now;
+  } else if (strstr(slave, "ESP32_B")) {
+    dev->bRssi = rssi; dev->bxPos = sx; dev->byPos = sy; dev->bTime = now;
   }
 
-  char anonId[65];
-  hashMAC(mac, anonId);
-  enqueueLocal(anonId, rssi, distance, isKnown, knownIndex);
+  float ex, ey;
+  if (triangulate(dev, &ex, &ey)) {
+    dev->estX = ex; dev->estY = ey; dev->published = false;
+  }
+}
+
+// ===================== THROTTLE =====================
+#define THROTTLE_SLOTS 32
+typedef struct { char hash[9]; unsigned long lastSent; } ThrottleEntry;
+static ThrottleEntry throttleTable[THROTTLE_SLOTS];
+static int           throttleCount = 0;
+
+bool shouldProcess(const char* hash) {
+  unsigned long now = millis();
+  for (int i = 0; i < throttleCount; i++) {
+    if (strcmp(throttleTable[i].hash, hash) == 0) {
+      if (now - throttleTable[i].lastSent < THROTTLE_MS) return false;
+      throttleTable[i].lastSent = now;
+      return true;
+    }
+  }
+  if (throttleCount < THROTTLE_SLOTS) {
+    strncpy(throttleTable[throttleCount].hash, hash, 9);
+    throttleTable[throttleCount].lastSent = now;
+    throttleCount++;
+  }
+  return true;
+}
+
+// ===================== TIMESTAMP =====================
+String getTimestamp() {
+  struct tm t;
+  char buf[30] = "unknown";
+  if (getLocalTime(&t)) strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
+  return String(buf);
 }
 
 // ===================== WIFI =====================
@@ -284,56 +285,24 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, WIFIPASSWORD);
   Serial.print("[WIFI] Forbinder");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(500); }
   Serial.println("\n[WIFI] Forbundet: " + WiFi.localIP().toString());
-}
-
-// ===================== MQTT RECONNECT =====================
-void reconnectMQTT() {
-  int attempts = 0;
-  while (!mqttClient.connected() && attempts < 5) {
-    Serial.printf("[MQTT] Forbinder til %s:%d ...\n", MQTT_HOST, MQTT_PORT);
-    String clientId = "ESP32Master-" + String(random(0xffff), HEX);
-    if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
-      Serial.println("[MQTT] Forbundet!");
-    } else {
-      Serial.printf("[MQTT] Fejlede, rc=%d — prøver igen om 5 sek\n", mqttClient.state());
-      attempts++;
-      delay(5000);
-    }
-  }
-  if (!mqttClient.connected()) {
-    Serial.println("[MQTT] Kunne ikke forbinde efter 5 forsøg");
-  }
 }
 
 // ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
   delay(200);
-
   Serial.println("========================================");
-  Serial.println("[BOOT] MASTER starter");
+  Serial.printf("[BOOT] Master starter @ (%.1f, %.1f)\n", MASTER_X, MASTER_Y);
+  Serial.printf("[BOOT] UDP → %s:%d\n", UDP_HOST, UDP_PORT);
   Serial.println("========================================");
 
   initWiFi();
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[ESP-NOW] Init fejlede!");
-  } else {
-    esp_now_register_recv_cb(onESPNowReceive);
-    Serial.println("[ESP-NOW] Klar — lytter efter slaves");
-  }
-
-  tlsClient.setCACert(MQTT_CA_CERT);
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(512);
-
-  espId();
-  reconnectMQTT();
+  udp.begin(WiFi.localIP(), 0);
+  slaveUdp.begin(SLAVE_UDP_PORT);
+  Serial.printf("[UDP] Lytter på slave-data port %d\n", SLAVE_UDP_PORT);
 
   configTime(0, 0, "pool.ntp.org");
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
@@ -341,49 +310,85 @@ void setup() {
   delay(1500);
   Serial.println("[NTP] Tid synkroniseret");
 
+  updateDailySalt();
+  Serial.printf("[MASTER] Salt: %s\n", dailySalt);
+
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
-  Serial.println("[SNIFFER] Kørende");
+  esp_wifi_set_channel(ROUTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[SNIFFER] Kørende på kanal %d\n", ROUTER_CHANNEL);
   Serial.println("========================================");
 }
 
 // ===================== LOOP =====================
+static unsigned long lastSaltCheck = 0;
+static int           lastDay       = -1;
+
 void loop() {
-  if (!mqttClient.connected()) {
-    Serial.println("[MQTT] Forbindelse tabt — genopretter...");
-    reconnectMQTT();
-  }
-  mqttClient.loop();
-
-  DetectionEvent evt;
-  while (dequeueEvent(&evt)) {
-    if (evt.fromESPNow) {
-      // Måling fra slave via ESP-NOW
-      Serial.printf("[ESP-NOW] %s ser '%s' — RSSI: %d dBm  ~%.1f m\n",
-        evt.espNowNode, evt.espNowDevice, evt.rssi, evt.distance);
-
-      // Find ESP32-position fra secrets.h
-      float nodeX = 0.0, nodeY = 0.0;
-      for (int i = 0; i < 3; i++) {
-        if (strcmp(evt.espNowNode, espNames[i]) == 0) {
-          nodeX = espPositions[i][0];
-          nodeY = espPositions[i][1];
-          break;
-        }
-      }
-      storeMeasurementAndCalculate(evt.espNowNode, nodeX, nodeY,
-                                    evt.distance, evt.espNowDevice);
-
-    } else if (evt.isKnown) {
-      // Lokal måling fra master selv
-      Serial.printf("[SNIFFER] Master ser '%s' — RSSI: %d dBm  ~%.1f m\n",
-        knownNames[evt.knownIndex], evt.rssi, evt.distance);
-
-      storeMeasurementAndCalculate(myName.c_str(), myX, myY,
-                                    evt.distance, knownNames[evt.knownIndex]);
+  // Opdater dagligt salt
+  if (millis() - lastSaltCheck > 60000) {
+    lastSaltCheck = millis();
+    struct tm t;
+    if (getLocalTime(&t) && t.tm_mday != lastDay) {
+      lastDay = t.tm_mday;
+      updateDailySalt();
+      Serial.printf("[MASTER] Salt opdateret: %s\n", dailySalt);
     }
   }
 
+  // Modtag slave-pakker via UDP
+  int pktSize = slaveUdp.parsePacket();
+  if (pktSize > 0 && pktSize < 256) {
+    char buf[256];
+    int len = slaveUdp.read(buf, sizeof(buf) - 1);
+    if (len > 0) processSlavePacket(buf, len);
+  }
+
+  // Drain master sniffer queue
+  while (!qEmpty()) {
+    SniffEvent evt = sniffQueue[qHead];
+    qHead = (qHead + 1) % QUEUE_SIZE;
+
+    char macHash[9];
+    macToHash(evt.mac, macHash);
+    if (!shouldProcess(macHash)) continue;
+
+    DeviceEntry* dev = findOrCreate(macHash);
+    dev->mRssi = evt.rssi;
+    dev->mxPos = MASTER_X;
+    dev->myPos = MASTER_Y;
+    dev->mTime = millis();
+
+    float ex, ey;
+    if (triangulate(dev, &ex, &ey)) {
+      dev->estX = ex; dev->estY = ey; dev->published = false;
+    }
+  }
+
+  // Send klar-til-send entries via UDP til laptop
+  for (int i = 0; i < deviceCount; i++) {
+    if (!devices[i].published) {
+      char payload[192];
+      snprintf(payload, sizeof(payload),
+        "{\"devId\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"ts\":\"%s\"}",
+        devices[i].devId, devices[i].estX, devices[i].estY,
+        getTimestamp().c_str());
+      sendUDP(payload);
+      devices[i].published = true;
+      Serial.printf("[UDP] Sendt: %s @ (%.2f, %.2f)\n",
+        devices[i].devId, devices[i].estX, devices[i].estY);
+    }
+  }
+
+  // Ryd enheder ikke set i 30 sek
+  unsigned long now = millis();
+  for (int i = 0; i < deviceCount; i++) {
+    unsigned long newest = max({devices[i].aTime, devices[i].bTime, devices[i].mTime});
+    if (newest > 0 && (now - newest) > 30000) {
+      devices[i] = devices[deviceCount - 1];
+      memset(&devices[deviceCount - 1], 0, sizeof(DeviceEntry));
+      deviceCount--;
+      i--;
+    }
+  }
 }
